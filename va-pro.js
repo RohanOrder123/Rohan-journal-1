@@ -16,35 +16,45 @@
   const tts = VA.tts, osp = tts.speak, ostop = tts.stop, ospk = tts.speaking;
   let audio = null, gen = 0, elSpeaking = false, elWarned = 0;
   const cache = new Map();
+  const DEFVOICE = '21m00Tcm4TlvDq8ikWAM';   /* ElevenLabs premade voice; works without the Voices (read) permission */
+  const voiceId = function () { return (pr.elVoice || DEFVOICE).trim(); };
+  const cleanKey = function (k) { return String(k || '').replace(/[\s\u200b-\u200d\ufeff"']/g, ''); };
   const elOn = function () { return !!pr.elKey && !pr.elOff && navigator.onLine !== false; };
   function elStop() { gen++; if (audio) { try { audio.pause(); } catch (e) { /* ignore */ } audio = null; } if (elSpeaking) { elSpeaking = false; VA.emit('speaking', false); } }
   async function elFetch(text) {
-    const key = pr.elVoice + '|' + pr.elModel + '|' + text;
+    const key = voiceId() + '|' + pr.elModel + '|' + text;
     if (cache.has(key)) return cache.get(key);
     const c = new AbortController(), t = setTimeout(function () { c.abort(); }, 15000);
     try {
-      const r = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + encodeURIComponent(pr.elVoice) + '?output_format=mp3_44100_64', {
+      const r = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + encodeURIComponent(voiceId()) + '?output_format=mp3_44100_64', {
         method: 'POST', signal: c.signal,
-        headers: { 'xi-api-key': pr.elKey, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
+        headers: { 'xi-api-key': cleanKey(pr.elKey), 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
         body: JSON.stringify({ text: text, model_id: pr.elModel, voice_settings: { stability: 0.45, similarity_boost: 0.8, style: 0.2, use_speaker_boost: true } })
       });
-      if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
+      if (!r.ok) { let j = null; try { j = await r.json(); } catch (x) { /* no body */ } const d = (j && (j.detail || j)) || {}; const e = new Error(typeof d === 'string' ? d : (d.message || d.status || ('HTTP ' + r.status))); e.status = r.status; e.code = String(typeof d === 'object' && d.status || ''); throw e; }
       const b = await r.blob();
       if (!b || b.size < 500) throw new Error('empty audio');
       cache.set(key, b); if (cache.size > 25) cache.delete(cache.keys().next().value);
       return b;
     } finally { clearTimeout(t); }
   }
+  function elMsg(e, l) {
+    const c = (e && e.code || '') + ' ' + (e && e.message || ''), st = e && e.status, hi = l !== 'en';
+    const raw = e && e.message ? ' (' + e.message + ')' : '';
+    if (/missing_permissions/.test(c)) return hi ? 'key सही है, पर उसमें Text to Speech की अनुमति चालू नहीं है। ElevenLabs > Developers > API Keys में Text to Speech (और Voices read) चालू करें।' : 'The key is valid but lacks the Text to Speech permission. Enable Text to Speech (and Voices read) under ElevenLabs > Developers > API Keys.';
+    if (/unusual|abuse|blocked|vpn|proxy/i.test(c)) return hi ? 'ElevenLabs ने इस अकाउंट को रोका है (अक्सर VPN/प्रॉक्सी या फ्री अकाउंट के दुरुपयोग की जाँच की वजह से)। VPN बंद करें और ElevenLabs का ईमेल देखें।' + raw : 'ElevenLabs blocked this account (often VPN/proxy or free-account abuse checks). Turn off the VPN and check your ElevenLabs email.' + raw;
+    if (st === 402 || st === 429 || /quota|limit|credit/i.test(c)) return hi ? 'ElevenLabs की लिमिट या क्रेडिट खत्म है' + raw + '। फ़ोन की आवाज़ चल रही है।' : 'ElevenLabs quota, credits or rate limit reached' + raw + '. Using the phone voice.';
+    if (st === 404 || /voice_not_found|voice.*not found/i.test(c)) return hi ? 'यह Voice ID इस अकाउंट में नहीं मिली। Load दबाकर आवाज़ चुनें या दूसरी Voice ID डालें।' : 'This Voice ID was not found on the account. Press Load and pick a voice, or paste another Voice ID.';
+    if (st === 401 || /invalid_api_key/.test(c)) return hi ? 'ElevenLabs इस key को नहीं मान रहा' + raw + '। key को पूरा दोबारा कॉपी करें (आम तौर पर sk_ से शुरू), बिना space के।' : 'ElevenLabs does not accept this key' + raw + '. Copy the full key again (usually starts with sk_), with no spaces.';
+    return hi ? 'ElevenLabs से कनेक्ट नहीं हो पाया' + raw + '। फ़ोन की आवाज़ चल रही है।' : 'Could not reach ElevenLabs' + raw + '. Using the phone voice.';
+  }
   function elWarn(e, l) {
-    const k = e && e.status === 401 ? 'key' : (e && e.status === 402 || e && e.status === 429) ? 'quota' : 'net';
+    const k = (e && e.status || '') + (e && e.code || '') + (e && e.message || '');
     if (elWarned === k) return; elWarned = k;
-    const m = { key: ['ElevenLabs key is wrong. Using the phone voice.', 'ElevenLabs की key गलत है। फ़ोन की आवाज़ इस्तेमाल हो रही है।'],
-      quota: ['ElevenLabs quota or rate limit reached. Using the phone voice.', 'ElevenLabs की लिमिट पूरी हो गई। फ़ोन की आवाज़ इस्तेमाल हो रही है।'],
-      net: ['ElevenLabs could not be reached. Using the phone voice.', 'ElevenLabs से कनेक्ट नहीं हो पाया। फ़ोन की आवाज़ इस्तेमाल हो रही है।'] }[k];
-    if (VA.ui && VA.ui.error) VA.ui.error(m[l === 'en' ? 0 : 1], 'el');
+    if (VA.ui && VA.ui.error) VA.ui.error(elMsg(e, l), 'el');
   }
   tts.speak = async function (text, l) {
-    if (!elOn() || !pr.elVoice) return osp.call(tts, text, l);
+    if (!elOn()) return osp.call(tts, text, l);
     text = String(text || '').trim(); if (!text) return false;
     ostop.call(tts); elStop();
     const my = ++gen; elSpeaking = true; VA.emit('speaking', true);
@@ -218,7 +228,8 @@
     d.innerHTML = '<div style="width:100%;max-width:520px;max-height:88vh;overflow:auto;background:var(--card,#111827);color:var(--tx,#e5e7eb);border-radius:18px 18px 0 0;padding:16px;font:14px system-ui"><b style="font-size:16px">Voice assistant - Pro settings</b>' +
       '<p style="opacity:.7;margin:6px 0 10px">ElevenLabs key is stored only on this phone.</p>' +
       '<label>ElevenLabs API key</label><input id="vp-key" type="password" autocomplete="off" style="width:100%;padding:10px;margin:4px 0 8px;border-radius:10px">' +
-      '<label>Voice</label><div style="display:flex;gap:6px;margin:4px 0 8px"><select id="vp-voice" style="flex:1;padding:10px;border-radius:10px"></select><button id="vp-load" style="padding:10px;border-radius:10px">Load</button></div>' +
+      '<label>Voice ID (optional - leave empty to use the default voice)</label><input id="vp-vid" autocomplete="off" placeholder="e.g. 21m00Tcm4TlvDq8ikWAM" style="width:100%;padding:10px;margin:4px 0 8px;border-radius:10px">' +
+      '<label>Or pick from your voices</label><div style="display:flex;gap:6px;margin:4px 0 8px"><select id="vp-voice" style="flex:1;padding:10px;border-radius:10px"></select><button id="vp-load" style="padding:10px;border-radius:10px">Load</button></div>' +
       '<label>Quality</label><select id="vp-model" style="width:100%;padding:10px;margin:4px 0 8px;border-radius:10px"><option value="eleven_flash_v2_5">Fast (Flash v2.5)</option><option value="eleven_multilingual_v2">Best quality (Multilingual v2)</option></select>' +
       '<label><input id="vp-off" type="checkbox"> Use phone voice only</label>' +
       '<label style="display:block;margin-top:8px">Assistant name</label><input id="vp-name" style="width:100%;padding:10px;margin:4px 0 8px;border-radius:10px">' +
@@ -228,20 +239,27 @@
       '<div style="display:flex;gap:8px"><button id="vp-test" style="flex:1;padding:12px;border-radius:10px">Test voice</button><button id="vp-save" style="flex:1;padding:12px;border-radius:10px;font-weight:700">Save</button><button id="vp-x" style="padding:12px;border-radius:10px">Close</button></div></div>';
     document.body.appendChild(d);
     const $ = function (i) { return d.querySelector('#' + i); }, msg = function (t) { $('vp-msg').textContent = t; };
-    $('vp-key').value = pr.elKey || ''; $('vp-model').value = pr.elModel; $('vp-off').checked = !!pr.elOff;
+    $('vp-key').value = pr.elKey || ''; $('vp-vid').value = pr.elVoice || ''; $('vp-model').value = pr.elModel; $('vp-off').checked = !!pr.elOff;
     $('vp-name').value = pr.name || ''; $('vp-addr').value = pr.addr || ''; $('vp-home').value = pr.home || '';
     const fill = function (list) { $('vp-voice').innerHTML = list.map(function (v) { return '<option value="' + v.voice_id + '">' + v.name + (v.labels && v.labels.gender ? ' (' + v.labels.gender + ')' : '') + '</option>'; }).join(''); if (pr.elVoice) $('vp-voice').value = pr.elVoice; };
     $('vp-load').onclick = async function () {
-      const k = $('vp-key').value.trim(); if (!k) return msg('Enter the API key first.');
+      const k = cleanKey($('vp-key').value); if (!k) return msg('Enter the API key first.');
       msg('Loading voices...');
-      try { const r = await fetch('https://api.elevenlabs.io/v1/voices', { headers: { 'xi-api-key': k } }); if (!r.ok) throw new Error(r.status === 401 ? 'Wrong API key' : 'HTTP ' + r.status);
+      try { const r = await fetch('https://api.elevenlabs.io/v1/voices', { headers: { 'xi-api-key': k } }); if (!r.ok) { let j = null; try { j = await r.json(); } catch (x) { /* no body */ } const d = (j && (j.detail || j)) || {}; if (r.status === 401 && /missing_permissions/.test(JSON.stringify(d))) throw new Error('KEY OK, but it has no "Voices (read)" permission. Either enable it in ElevenLabs > Developers > API Keys, or just paste a Voice ID above and press Test voice.'); const e = new Error(d.message || d.status || ('HTTP ' + r.status)); e.status = r.status; e.code = String(d.status || ''); throw e; }
         const j = await r.json(), v = (j.voices || []).sort(function (a, b) { return ((b.labels && b.labels.gender === 'female') | 0) - ((a.labels && a.labels.gender === 'female') | 0); });
         if (!v.length) throw new Error('No voices on this account'); fill(v); msg(v.length + ' voices loaded. Pick one, then Test voice.'); }
-      catch (e) { msg('Could not load: ' + (e && e.message || 'network')); }
+      catch (e) { msg(/^KEY OK/.test(e && e.message) ? e.message : 'Could not load voices: ' + elMsg(e, 'hi')); }
     };
-    const store = function () { pr.elKey = $('vp-key').value.trim(); pr.elVoice = $('vp-voice').value || pr.elVoice || ''; pr.elModel = $('vp-model').value; pr.elOff = $('vp-off').checked; pr.name = $('vp-name').value.trim() || pr.name; pr.addr = $('vp-addr').value.trim() || pr.addr; pr.home = $('vp-home').value.trim() || pr.home; cache.clear(); elWarned = 0; VA.savePrefs(); };
+    const store = function () { pr.elKey = cleanKey($('vp-key').value); pr.elVoice = $('vp-vid').value.trim() || $('vp-voice').value || pr.elVoice || ''; pr.elModel = $('vp-model').value; pr.elOff = $('vp-off').checked; pr.name = $('vp-name').value.trim() || pr.name; pr.addr = $('vp-addr').value.trim() || pr.addr; pr.home = $('vp-home').value.trim() || pr.home; cache.clear(); elWarned = 0; VA.savePrefs(); };
     $('vp-save').onclick = function () { store(); msg('Saved.'); };
-    $('vp-test').onclick = function () { store(); if (!pr.elVoice) return msg('Press Load and choose a voice first.'); msg('Speaking...'); tts.speak(L() === 'hi' ? 'नमस्ते ' + addr() + ', मैं ' + pr.name + ' हूँ। अब मेरी आवाज़ कैसी लग रही है?' : 'Hello ' + addr() + ', I am ' + pr.name + '. How does my voice sound now?', L()).then(function () { msg('Done.'); }); };
+    $('vp-test').onclick = async function () {
+      store(); if (!pr.elKey) return msg('Enter the API key first.');
+      msg('Testing ElevenLabs...');
+      try {
+        const b = await elFetch(L() === 'hi' ? 'नमस्ते ' + addr() + ', मैं ' + pr.name + ' हूँ। अब मेरी आवाज़ कैसी लग रही है?' : 'Hello ' + addr() + ', I am ' + pr.name + '. How does my voice sound now?');
+        const u = URL.createObjectURL(b), a = new Audio(u); await a.play(); msg('ElevenLabs is working. The voice is playing.');
+      } catch (e) { msg('Failed: ' + elMsg(e, 'hi')); }
+    };
     $('vp-x').onclick = function () { d.style.display = 'none'; };
     if (pr.elVoice) fill([{ voice_id: pr.elVoice, name: 'Saved voice' }]);
   }
