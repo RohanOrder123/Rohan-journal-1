@@ -21,22 +21,48 @@
   const cleanKey = function (k) { return String(k || '').replace(/[\s\u200b-\u200d\ufeff"']/g, ''); };
   const elOn = function () { return !!pr.elKey && !pr.elOff && navigator.onLine !== false; };
   function elStop() { gen++; if (audio) { try { audio.pause(); } catch (e) { /* ignore */ } audio = null; } if (elSpeaking) { elSpeaking = false; VA.emit('speaking', false); } }
+  /* Audio must arrive as raw bytes. Capacitor's patched fetch can hand back base64 TEXT instead of an MP3, which the
+     player rejects ("no supported source"). So: real WebView fetch first, then the patched one, then the native plugin;
+     every result is checked for MP3 bytes, and base64 text is decoded when needed. */
+  const isMp3 = function (u) { return u && u.length > 200 && ((u[0] === 0x49 && u[1] === 0x44 && u[2] === 0x33) || (u[0] === 0xFF && (u[1] & 0xE0) === 0xE0)); };
+  function fromB64(t) { const b = atob(String(t).replace(/^data:[^,]*,/, '').replace(/\s+/g, '')), u = new Uint8Array(b.length); for (let k = 0; k < b.length; k++) u[k] = b.charCodeAt(k); return u; }
+  function toAudio(u) {
+    if (isMp3(u)) return u;
+    try { const t = new TextDecoder().decode(u).trim(); if (t.length > 400 && /^[A-Za-z0-9+/=\s]+$/.test(t)) { const d = fromB64(t); if (isMp3(d)) return d; } } catch (e) { /* not base64 */ }
+    return null;
+  }
+  function apiError(status, u) {
+    let d = {}; try { const j = JSON.parse(new TextDecoder().decode(u)); d = j.detail || j; } catch (x) { /* no JSON body */ }
+    const e = new Error(typeof d === 'string' ? d : (d.message || d.status || ('HTTP ' + status))); e.status = status; e.code = String(typeof d === 'object' && d.status || ''); return e;
+  }
   async function elFetch(text) {
     const key = voiceId() + '|' + pr.elModel + '|' + text;
     if (cache.has(key)) return cache.get(key);
-    const c = new AbortController(), t = setTimeout(function () { c.abort(); }, 15000);
+    const url = 'https://api.elevenlabs.io/v1/text-to-speech/' + encodeURIComponent(voiceId()) + '?output_format=mp3_44100_64';
+    const headers = { 'xi-api-key': cleanKey(pr.elKey), 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' };
+    const body = { text: text, model_id: pr.elModel, voice_settings: { stability: 0.45, similarity_boost: 0.8, style: 0.2, use_speaker_boost: true } };
+    const ctl = new AbortController(), timer = setTimeout(function () { ctl.abort(); }, 20000);
+    const viaFetch = function (f) { return async function () { const r = await f(url, { method: 'POST', headers: headers, body: JSON.stringify(body), signal: ctl.signal }); return { status: r.status, bytes: new Uint8Array(await r.arrayBuffer()) }; }; };
+    const H = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.CapacitorHttp;
+    const tries = [];
+    if (window.CapacitorWebFetch) tries.push(viaFetch(window.CapacitorWebFetch.bind(window)));
+    tries.push(viaFetch(function (a, b) { return fetch(a, b); }));
+    if (H && H.request) tries.push(async function () {
+      const r = await H.request({ url: url, method: 'POST', headers: headers, data: body, responseType: 'blob' });
+      const d = r.data; const u = typeof d === 'string' ? (function () { try { return fromB64(d); } catch (x) { return new TextEncoder().encode(d); } })() : new TextEncoder().encode(JSON.stringify(d || {}));
+      return { status: r.status, bytes: u };
+    });
+    let last = new Error('no response');
     try {
-      const r = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + encodeURIComponent(voiceId()) + '?output_format=mp3_44100_64', {
-        method: 'POST', signal: c.signal,
-        headers: { 'xi-api-key': cleanKey(pr.elKey), 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
-        body: JSON.stringify({ text: text, model_id: pr.elModel, voice_settings: { stability: 0.45, similarity_boost: 0.8, style: 0.2, use_speaker_boost: true } })
-      });
-      if (!r.ok) { let j = null; try { j = await r.json(); } catch (x) { /* no body */ } const d = (j && (j.detail || j)) || {}; const e = new Error(typeof d === 'string' ? d : (d.message || d.status || ('HTTP ' + r.status))); e.status = r.status; e.code = String(typeof d === 'object' && d.status || ''); throw e; }
-      const b = await r.blob();
-      if (!b || b.size < 500) throw new Error('empty audio');
-      cache.set(key, b); if (cache.size > 25) cache.delete(cache.keys().next().value);
-      return b;
-    } finally { clearTimeout(t); }
+      for (let k = 0; k < tries.length; k++) {
+        try {
+          const r = await tries[k]();
+          if (r.status >= 200 && r.status < 300) { const au = toAudio(r.bytes); if (au) { const b = new Blob([au], { type: 'audio/mpeg' }); cache.set(key, b); if (cache.size > 25) cache.delete(cache.keys().next().value); return b; } last = new Error('audio data was not valid MP3 (path ' + (k + 1) + ')'); }
+          else if (r.status) throw apiError(r.status, r.bytes);     /* a real API answer (401, 402, 404...): stop and report it */
+        } catch (e) { if (e && e.status) throw e; last = e; }      /* network / CORS / bad audio: try the next path */
+      }
+      throw last;
+    } finally { clearTimeout(timer); }
   }
   function elMsg(e, l) {
     const c = (e && e.code || '') + ' ' + (e && e.message || ''), st = e && e.status, hi = l !== 'en';
@@ -61,7 +87,7 @@
     try {
       const blob = await elFetch(text);
       if (my !== gen) return false;
-      const url = URL.createObjectURL(blob), a = new Audio(url); audio = a;
+      const url = URL.createObjectURL(blob), a = new Audio(url); a.preload = 'auto'; audio = a;
       a.volume = Math.min(1, pr.volume || 1); a.playbackRate = pr.rate && pr.rate > 0 ? Math.min(1.5, Math.max(0.7, pr.rate)) : 1;
       await new Promise(function (res, rej) { a.onended = res; a.onerror = function () { rej(new Error('play')); }; const p = a.play(); if (p && p.catch) p.catch(rej); });
       URL.revokeObjectURL(url);
